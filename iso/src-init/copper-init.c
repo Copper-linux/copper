@@ -1,6 +1,5 @@
 /*
  * copper-init — Copper Linux PID 1.
- * handcrafted by 12hrformat
  *
  * No systemd, no init scripts: this IS the init. It mounts the basics
  * (the initramfs already did most of it), applies the hostname, brings the
@@ -179,8 +178,8 @@ static void start_dhcp(const char *ifname) {
     if (pid != 0)
         return;
     /* udhcpc passes its own environment to the lease script and never sets
-       PATH itself, so the script needs one to find ip(8). */
-    setenv("PATH", "/sbin:/usr/sbin:/bin:/usr/bin", 1);
+       PATH itself, so the script needs one to find ip(8). It already inherits
+       the PATH set in main() before anything was forked. */
     snprintf(pidfile, sizeof pidfile, "/run/udhcpc.%s.pid", ifname);
     execl("/sbin/udhcpc", "udhcpc", "-i", ifname, "-b", "-p", pidfile,
           (char *)NULL);
@@ -238,8 +237,136 @@ static pid_t spawn_tty(int tty) {
     _exit(1);
 }
 
+/* Should the graphical desktop be suppressed?
+
+   The kernel command line is the only switch available here. There is no
+   bootloader menu entry to add and no config file to read, because on a first
+   boot the wizard has not run and /etc is still whatever the initramfs left
+   behind. `nogui`, or `gui=0`, appears in /proc/cmdline.
+
+   This is not a nicety. copper-gui programs the VGA into a graphics mode, and
+   on a machine whose framebuffer it cannot drive there is no way back to a text
+   console once that has happened -- the shell exists, but there is no longer a
+   screen to show it on. Being able to append one word at the GRUB prompt is the
+   difference between "boot it with a flag" and "rebuild the ISO". */
+static int gui_suppressed(void) {
+    char line[512];
+    FILE *f = fopen("/proc/cmdline", "r");
+
+    if (!f)
+        return 0;                   /* no /proc: assume the normal case */
+    if (!fgets(line, sizeof line, f)) {
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    return strstr(line, "nogui") != NULL || strstr(line, "gui=0") != NULL;
+}
+
+/* Start the graphical desktop, if this machine has a framebuffer to put it on.
+
+   Returns the child's pid, or 0 when the GUI is not wanted and the caller should
+   fall back to a shell. */
+static pid_t start_gui(void) {
+    if (gui_suppressed()) {
+        say("copper: nogui on the kernel command line, starting the shell");
+        return 0;
+    }
+    if (access("/dev/fb0", R_OK) != 0) {
+        /* Not an error. It is a kernel built without a graphics driver, and a
+           shell is the right thing to hand it. */
+        say("copper: no /dev/fb0, starting the shell");
+        return 0;
+    }
+
+    pid_t pid = fork();
+    if (pid != 0)
+        return pid;
+
+    /* Its own session, and a log on stdout that is *not* the screen.
+
+       This used to dup /dev/console onto stdout and stderr, on the reasoning
+       that the console was where diagnostics went. It is not, any more, once
+       the desktop is running: /dev/console is whichever console= appears last
+       on the kernel command line, and the default boot entry ends with
+       console=tty0. So that "log" was the framebuffer.
+
+       copper-gui prints the line it uses to report the desktop is up, and it
+       prints it after drawing, because before drawing it would be reporting
+       something that had not happened. With stdout on tty0, fbcon rendered
+       that line as a console row and stamped it over the finished desktop: a
+       black band the width of the text, across the title bar, with grey
+       glyphs in it. Measured at 1280x800, one 16-pixel row from x=0 to x=447,
+       which is 56 console columns -- the length of the message.
+
+       It read as a rendering bug and it was not one. The desktop drew every
+       pixel correctly; a log line was written over the top of it afterwards.
+
+       So the log goes to a serial port when the kernel gave us one, and to
+       /dev/null when it did not. Never to the console, because the console is
+       the desktop now. A desktop with a line of text painted across it is
+       broken, and no amount of correct drawing underneath fixes that. */
+    setsid();
+    {
+        static const char *logs[] = { "/dev/ttyS0", "/dev/ttyS1", "/dev/ttyS2",
+                                      "/dev/ttyS3" };
+        unsigned nlogs = sizeof logs / sizeof logs[0];
+        unsigned i;
+        int logfd = -1;
+
+        for (i = 0; i < nlogs; i++) {
+            logfd = open(logs[i], O_WRONLY | O_NOCTTY);
+            if (logfd >= 0)
+                break;
+        }
+        if (logfd < 0)
+            logfd = open("/dev/null", O_WRONLY);
+
+        if (logfd >= 0) {
+            dup2(logfd, 1);
+            dup2(logfd, 2);
+            if (logfd > 2)
+                close(logfd);
+        }
+        /* stdin is left alone: copper-gui reads /dev/input, not the terminal,
+           and the shell this init falls back to needs the console back. */
+    }
+    execl("/usr/bin/copper-gui", "copper-gui", (char *)NULL);
+    /* Reaching here means the binary is not in the image. Say so instead of
+       exiting into a blank screen: the caller's fallback puts a shell up in a
+       moment, and a silent failure here would look like a hang. */
+    say("copper: /usr/bin/copper-gui is missing from the image");
+    _exit(127);
+}
+
 int main(void) {
     console_stdio();
+
+    /* PATH, set once, here, before anything is forked.
+
+       This was the cause of "ip: command not found" and "ifconfig: command
+       not found" on a booted system, and it is worth writing down properly
+       because the commands were never missing.
+
+       PID 1 starts with an environment the kernel builds, and it has no PATH
+       in it. When a program has no PATH, execvp() falls back to
+       confstr(_CS_PATH), which is the kernel's compiled-in default:
+
+           /bin:/usr/bin
+
+       Copper's networking applets are in sbin. So `ip`, `ifconfig`, `route`,
+       `arp` and everything else installed under /sbin and /usr/sbin were
+       unreachable by name, while `ping`, `grep`, `touch` and the rest worked
+       because they are in /bin and /usr/bin. The commands were present,
+       compiled in, and correctly linked the whole time -- the shell was
+       simply never told to look in sbin.
+
+       Setting it in start_dhcp() did not help, because that runs in a forked
+       child: the child got a PATH and the shell, which is what people
+       actually type at, did not. Anything that wants a PATH has to inherit
+       it from here. */
+    setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+           1);
 
     signal(SIGINT, SIG_IGN);
     signal(SIGTERM, SIG_IGN);
@@ -291,18 +418,73 @@ int main(void) {
         waitpid(wiz, &wst, 0);
     }
 
-    /* Exactly one shell at a time. Keep the pid so the reaper below can wait on
-       this specific child instead of on any child: udhcpc is our child too, and
-       `udhcpc -b` leaves a short-lived parent behind when it daemonises.
+    /* Land in the user's own home, not in /.
+
+       This has to happen after the wizard, not before: on a first boot the
+       done-marker does not exist yet, so reading it any earlier finds nothing.
+       /etc/copper-firstboot.done holds the username on its first line, written
+       by the wizard as it finishes.
+
+       Dropping someone at / is worth avoiding. That is uid 0 sitting next to
+       /boot, /etc and the block devices, with no login in front of it. This
+       does not make the system safe -- init goes straight to a root shell, and
+       pretending otherwise would be worse than saying so plainly -- but the
+       working directory should not be the root of the filesystem. */
+    {
+        char who[64] = "";
+        FILE *m = fopen("/etc/copper-firstboot.done", "r");
+        if (m) {
+            if (fgets(who, sizeof who, m)) {
+                char *nl = strchr(who, '\n');
+                if (nl) *nl = '\0';
+            }
+            fclose(m);
+        }
+        if (who[0]) {
+            char home[160];
+            snprintf(home, sizeof home, "/home/%s", who);
+            /* Only adopt it if it is a real, enterable directory: a stale
+               marker left by a half-finished wizard must not put us somewhere
+               that does not exist. */
+            if (access(home, X_OK) == 0 && chdir(home) == 0) {
+                setenv("HOME", home, 1);
+                setenv("USER", who, 1);
+                setenv("LOGNAME", who, 1);
+            } else {
+                printf("copper: no home directory at %s -- staying in /\n",
+                       home);
+            }
+        }
+    }
+
+    /* The graphical desktop owns the screen once the wizard is out of the way.
+
+       It comes after the wizard rather than before it, because the wizard asks
+       questions on the text console and a desktop that takes the screen first
+       would leave those questions with nowhere to be seen or answered.
+
+       start_gui() returns 0 whenever the desktop is not wanted -- nogui on the
+       command line, no /dev/fb0, or copper-gui absent from the image -- and this
+       then falls through to exactly the shell every earlier build gave you. A
+       machine with no graphics driver gets a shell, not a broken screen.
+
+       When the desktop does run and later exits, the shell is what comes up
+       next. That is deliberate: copper-gui quits on Escape, and a desktop with
+       no escape route out of it is a dead end for anyone whose hardware it does
+       not suit. */
+    pid_t session = start_gui();
+
+    /* Exactly one session at a time. Keep the pid so the reaper below can wait
+       on this specific child instead of on any child: udhcpc is our child too,
+       and `udhcpc -b` leaves a short-lived parent behind when it daemonises.
        waitpid(-1) would return on that exit and start a second copper-sh on the
        same tty, so two shells fought over stdin -- typing came out garbled and
        the banner printed twice. */
-    pid_t sh = spawn_tty(1);
     for (;;) {
         int wst;
-        if (sh > 0)
-            waitpid(sh, &wst, 0);
-        sh = spawn_tty(1);
+        if (session > 0)
+            waitpid(session, &wst, 0);
+        session = spawn_tty(1);
     }
     return 0;                        /* never reached */
 }
