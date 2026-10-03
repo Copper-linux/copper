@@ -38,7 +38,13 @@ export FORCE_UNSAFE_CONFIGURE=1
 # reproducible, not "latest at build time". Bump this when we want a newer
 # LTS; override with KREL=6.6.x if you need a different series.
 KREL=${KREL:-6.12.10}
-KPATH="v${KREL%%.*}.x"
+# kernel.org moved every maintained series out of the per-series directory
+# (v6.12.x/) and into one shared one (v6.x/). The old layout now 404s for every
+# patchlevel, including the current one the site itself advertises, so building
+# the URL from the series number fetched nothing and every cold build died at
+# the fetch below. Only pinned kernels old enough to be EOL live under
+# Historic/ instead, and Copper pins a maintained LTS.
+KPATH=${KPATH:-v6.x}
 
 STAGE=${1:-all}
 
