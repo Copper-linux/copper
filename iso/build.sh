@@ -156,6 +156,27 @@ require_kernel_config() {
     echo "kernel: these options did not survive olddefconfig:$missing" >&2
     exit 1
   fi
+
+  # The half of the graphical desktop that is easy to get backwards.
+  #
+  # FRAMEBUFFER_CONSOLE routes the VGA text console through the framebuffer
+  # instead of the legacy text buffer. That changes how the boot art is rendered,
+  # and the drawing is the one thing in this image nobody is allowed to change, so
+  # it stays off and the artwork keeps the path it has always had.
+  #
+  # Asserted rather than merely requested, because the failure mode is silent: a
+  # kernel bump, or a graphics driver that selects it, would switch the console
+  # over without anybody asking, the build would still succeed, and the symptom
+  # would be subtly different artwork that still looked roughly right.
+  #
+  # Note the symbol is simply absent from the config today, because CONFIG_FB is
+  # not set either -- see build_kernel for why there is no framebuffer here yet.
+  if grep -q '^CONFIG_FRAMEBUFFER_CONSOLE=y' "$cfg"; then
+    echo "kernel: CONFIG_FRAMEBUFFER_CONSOLE came back on; that would change" >&2
+    echo "        how the boot art is rendered. It must stay off." >&2
+    exit 1
+  fi
+
   echo "kernel: config looks fit to boot and to reach the network"
 }
 
@@ -180,9 +201,47 @@ build_kernel() {
       --enable VMXNET3 --enable VMWARE_VMXNET3 \
       --enable ATA --enable ATA_PIIX --enable BLK_DEV_SD --enable BLK_DEV_NVME \
       --enable EXT4_FS --enable PACKET --enable UNIX --enable VT \
-      --enable VGA_CONSOLE --enable INPUT
+      --enable VGA_CONSOLE --enable INPUT \
+      --disable FRAMEBUFFER_CONSOLE
     # vmxnet3 was renamed at some point around 6.12; asking for both names
     # costs nothing, since kconfig drops whichever one doesn't exist.
+    #
+    # DRM_BOCHS is deliberately NOT enabled here. It was, and the consequence was
+    # measured rather than assumed:
+    #
+    #     bochs-drm 0000:00:02.0: vgaarb: deactivate vga console
+    #     Console: switching to colour dummy device 80x25
+    #
+    # at about 1.7 seconds, during kernel bring-up -- long before anything in the
+    # image draws anything. bochs-drm takes exclusive ownership of the VGA
+    # hardware, and with CONFIG_FRAMEBUFFER_CONSOLE off nothing ever takes it
+    # back, because fbcon is precisely the thing that re-registers tty0 against
+    # the new framebuffer. tty0 is then left registered, accepts writes, and
+    # discards them: writing to /dev/tty0 returns 0, and a screendump taken after
+    # clearing the screen and printing 80 '@' onto it is indistinguishable from
+    # one taken from a boot where nothing was written at all.
+    #
+    # The image would still build, still boot, still bring up a desktop
+    # afterwards, and would never once display the boot art. That is a worse
+    # trade than having no desktop, so the flag is off and the boot art is left
+    # exactly as it was.
+    #
+    # Having both needs fbcon enabled with the classic VGA font pinned, so that
+    # the artwork is rasterised by the same glyphs the text plane used. Whether
+    # that output is genuinely identical is a question about pixels, to be
+    # measured against the current rendering, and it is a decision about the
+    # artwork. It does not belong in a kernel config line, which is why this
+    # comment exists: so the next person to solve the framebuffer by adding
+    # DRM_BOCHS finds out what it costs before shipping it.
+    #
+    # The desktop therefore comes up only where a framebuffer already exists, and
+    # this kernel does not provide one: CONFIG_FB is not set and DRM_BOCHS is not
+    # set, so /dev/fb0 does not exist and copper-gui never starts. On the ISO that
+    # is today is a shell, exactly as it was before any of this. copper-gui exits
+    # 1 with a clear message when /dev/fb0 is absent, and copper-init falls
+    # straight through to the shell in that case, so nothing regresses -- but the
+    # desktop is wired in and waiting, not running, and the commit message says
+    # so rather than leaving it to be discovered on a first boot.
     make olddefconfig
     require_kernel_config "$KD/.config"
     make -j"$JOBS" bzImage
@@ -347,10 +406,13 @@ build_tools() {
 # ---------------------------------------------------------------
 build_copper() {
   local SRC="$REPO/src"
+  local GUI="$ROOT/gui"
   if [ -x "$TGT/usr/bin/copper-sh" ] && [ -x "$TGT/usr/bin/copper-init" ] \
      && [ -x "$TGT/usr/bin/copper-firstboot" ] \
+     && [ -x "$TGT/usr/bin/copper-gui" ] \
      && stamped_skip "$WORK/copper.stamp" "$SELF" "$SRC"/*.c "$SRC"/*.h \
-        "$ROOT/src-init/copper-init.c" "$ROOT/firstboot/copper-firstboot.c"
+        "$ROOT/src-init/copper-init.c" "$ROOT/firstboot/copper-firstboot.c" \
+        "$GUI/copper-gui.c" "$GUI/fbabi.h" "$GUI/font8x8.h"
   then
     echo "copper: already built, skipping"; return
   fi
@@ -361,6 +423,12 @@ build_copper() {
      "$ROOT/src-init/copper-init.c"
   $CC $CFLAGS -std=c11 -o "$TGT/usr/bin/copper-firstboot" \
      "$ROOT/firstboot/copper-firstboot.c"
+  # The desktop. -I "$GUI" for font8x8.h, which is compiled in rather than loaded
+  # at runtime: there is no font file to find on a machine that is still deciding
+  # whether it has a graphics driver, and a desktop that cannot find its own font
+  # is a desktop of empty rectangles.
+  $CC $CFLAGS -std=c11 -o "$TGT/usr/bin/copper-gui" \
+     "$GUI/copper-gui.c" -I "$GUI"
   ln -sf /usr/bin/copper-init "$TGT/sbin/init"   # our PID 1
 
   # hotfix tools — copper charge and copper rollback
@@ -374,6 +442,7 @@ build_copper() {
   # in build_rootfs instead — this stage runs before the overlay is copied.)
   local f
   for f in usr/bin/copper-init usr/bin/copper-sh usr/bin/copper-firstboot \
+           usr/bin/copper-gui \
            usr/bin/copper-charge usr/bin/copper-rollback usr/bin/copper; do
     if [ ! -x "$TGT/$f" ]; then
       echo "copper: $f is missing from the staged rootfs" >&2
@@ -393,6 +462,7 @@ build_copper() {
 
   stamp_set "$WORK/copper.stamp" "$SELF" "$SRC"/*.c "$SRC"/*.h \
     "$ROOT/src-init/copper-init.c" "$ROOT/firstboot/copper-firstboot.c" \
+    "$GUI/copper-gui.c" "$GUI/fbabi.h" "$GUI/font8x8.h" \
     "$ROOT/copper-charge.sh" "$ROOT/copper-rollback.sh" "$ROOT/copper.sh"
 }
 
@@ -543,7 +613,7 @@ assert_commands_reachable() {
       adduser addgroup chpasswd \
       ip ifconfig route ping wget nslookup \
       mount umount switch_root \
-      copper copper-charge copper-rollback \
+      copper copper-charge copper-rollback copper-gui \
       vi ; do
 
     found=""
