@@ -37,7 +37,6 @@ case_run() {
     rm -rf "$dir"
     mkdir -p "$dir/src"
     cp "$REPO/iso/firstboot/copper-firstboot.c" "$dir/src/"
-    cp "$REPO/iso/firstboot/boot-art.h" "$dir/src/"
 
     python3 - "$dir/src/copper-firstboot.c" "$sabotage" <<'PY'
 import sys, pathlib

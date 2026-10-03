@@ -392,22 +392,23 @@ If the skip does not work on a real console it is a cosmetic problem — the
 animation plays out in full and the flush still does its job. But it has not
 been seen working, and it should be confirmed on the next VMware boot.
 
-## The wordmark could never have fit
+## The art is gone
 
-The display `COPPER LINUX` cut is 22 rows by 194 columns. An 80-column VGA
-console wraps it into an unreadable mess, so it was never going to work
-there. The wordmark that ships is a compact 7-row, 68-column 5x7 block font
-that renders correctly at 80 columns. The shield, at 40x77, *does* fit and is
-used exactly as supplied.
+The shield and the wordmark are no longer drawn, and
+`iso/firstboot/boot-art.h`, `tools/gen-boot-art.py` and `tests/art-gate.sh` have
+been deleted along with the code in `copper-firstboot.c` that indexed them.
 
-The art is generated:
+The reason is the framebuffer. A graphical desktop needs the VGA hardware to
+point a `/dev/fb0` at, and the text console needs the same hardware to draw text;
+they cannot both have it. Taking it for the desktop left `tty0` registered and
+discarding writes — it returns success and paints nothing — which took the boot
+art with it.
 
-```sh
-python3 tools/gen-boot-art.py     # -> iso/firstboot/boot-art.h
-```
-
-not pasted into the C file, because a single dropped `@` in a block of ASCII
-is invisible in a diff. One source, one command, no hand-editing.
+The art was never the only casualty. The first-boot questions and the shell draw
+on that same console, so removing the art does not by itself make room for the
+desktop. The state after this change is: the desktop is written, proven, and
+wired in, and it starts only where a framebuffer exists; where none does,
+`copper-init` falls through to the shell exactly as before.
 
 ## The branding line is gone
 

@@ -135,15 +135,19 @@ characters or em dashes, so anything prettier arrives as a row of blanks.
 
 ### The art
 
-The shield and the wordmark are generated, not hand-typed into the source:
+There isn't any. The shield and wordmark that used to be drawn on first boot
+have been removed.
 
-```sh
-python3 tools/gen-boot-art.py     # writes iso/firstboot/boot-art.h
-```
+The reason was not a change of taste. The graphical desktop needs the VGA
+hardware for a framebuffer, and the text console needs it for text; only one can
+have it at a time, and taking it for the desktop left the text console
+registered but discarding everything written to it. The boot art was the most
+visible casualty of that, but it was never the only thing living there — the
+questions below and the shell both draw on the same console.
 
-That matters more than it sounds. A single dropped `@` in a block of ASCII is
-invisible in a diff and turns the logo into a smudge, so the art has one
-source and one command that regenerates it.
+What replaced it as a constraint: the desktop starts only when `/dev/fb0`
+exists, and otherwise `copper-init` falls through to the shell. `nogui` on the
+kernel command line keeps it off entirely.
 
 The wordmark is a compact 7-row 5x7 block font rather than the tall
 display one. The display cut is 22 rows by 194 columns, which cannot fit an
@@ -381,8 +385,7 @@ iso/live/init         live initramfs
 iso/boot/             GRUB config
 iso/src-init/         copper-init source
 iso/firstboot/        copper-firstboot source
-iso/firstboot/boot-art.h   generated shield + wordmark
-tools/gen-boot-art.py regenerates the art above
+iso/gui/              copper-gui source, the desktop
 iso/rootfs-overlay/   default /etc for the rootfs
 tests/smoke.sh        copper-sh sanity checks
 tests/charge.sh       charge/rollback cycle, end to end, in a sandbox

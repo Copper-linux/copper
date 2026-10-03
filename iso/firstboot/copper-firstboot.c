@@ -26,14 +26,6 @@
 #include <termios.h>
 #include <unistd.h>
 
-#include "boot-art.h"
-
-/* How long each row of the shield is left on screen. The whole point is that
-   it is drawn a row at a time rather than appearing at once. 40 rows at 100ms
-   is a four second boot animation, which is longer than it sounds -- so it is
-   skippable: press any key and it snaps to the end. Change it here. */
-#define BOOT_LINE_DELAY_MS 100
-
 static void banner(void) {
     printf("\n===================================================\n");
     printf("         Welcome to Copper Linux\n");
@@ -77,10 +69,9 @@ static void term_size(void) {
     }
 }
 
-/* The animation and the form are for a real terminal and nothing else. On a
-   serial console they are worse than decoration: they clear the scrollback
-   that somebody is reading to find out why the boot is stuck. So this is a
-   gate, not a preference. */
+/* The form is for a real terminal and nothing else. On a serial console it is
+   worse than decoration: it clears the scrollback that somebody is reading to
+   find out why the boot is stuck. So this is a gate, not a preference. */
 static int ui_fancy;
 
 static void ui_init(void) {
@@ -93,171 +84,24 @@ static void msleep(int ms) { usleep((useconds_t)ms * 1000); }
 
 /* Wipe the screen and put the cursor at the top left.
 
-   The DECSTBM reset (\033[r) before the erase is not decoration. The shield is
-   40 rows drawn onto a 25-row screen, so the console scrolls fifteen times,
-   and a console sitting inside a scroll region counts those lines against the
-   region rather than the whole screen. \033[H would then home to the top of
-   the *region*, not the top of the screen, and everything drawn afterwards
-   would sit low by however much had scrolled away.
+   The DECSTBM reset (\033[r) before the erase is not decoration. A console
+   sitting inside a scroll region counts scrolled lines against the region
+   rather than the whole screen, so \033[H on its own can home to the top of
+   the *region* rather than the top of the screen, and everything drawn
+   afterwards lands low by however much has scrolled away.
 
-   That is the "weird shift" half way through the boot: the shield scrolls,
-   the clear does not put the cursor back where this code thinks it is, and
-   the wordmark and the form both land low. Resetting the region first means
-   the position of everything after this point is decided here and not by
-   whatever the console happened to be doing. */
+   This was found by the boot art, which was 40 rows drawn onto a 25-row screen
+   and so scrolled fifteen times, putting the form visibly out of place half way
+   through the boot. The art is gone, but the form redraws itself as fields are
+   answered, so a console that has scrolled is still reachable by this path, and
+   the reset is one byte. Resetting the region first means the position of
+   everything after this point is decided here and not by whatever the console
+   happened to be doing. */
 static void clr(void)      { fputs("\033[r\033[2J\033[H", stdout); }
 static void at(int r, int c) { printf("\033[%d;%dH", r, c); }
-static void cursor_show(int on) { fputs(on ? "\033[?25h" : "\033[?25l", stdout); }
-
-/* Is somebody leaning on a key? Used to let the boot animation be skipped. */
-static int key_pending(void) {
-    fd_set fds;
-    struct timeval tv = { 0, 0 };
-    FD_ZERO(&fds);
-    FD_SET(STDIN_FILENO, &fds);
-    return select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0;
-}
-
-/* Throw away anything already typed.
-
-   tcflush, not read(). A read() here would wait for a COMPLETE LINE, and the
-   tty is in canonical mode at this point in the boot -- so on a machine where
-   the key that skipped the animation was not followed by Enter, the read
-   blocks until the next keypress. That turns "press any key to skip" into a
-   frozen screen, and then that stray keypress arrives as the first character
-   of the first answer, silently eating the first letter of it. */
-static void drain_keys(void) {
-    tcflush(STDIN_FILENO, TCIFLUSH);
-}
-
-/* ------------------------------------------------------------------ */
-/*  the boot animation                                                 */
-/* ------------------------------------------------------------------ */
-
-/* Type the shield in a row at a time, then wipe it and show the wordmark, then
-   wipe that too and hand over to the questions.
-
-   The shield is 40 rows by 77 columns. A standard VGA console is 25 by 80, so
-   it does not fit vertically, and letting it try is what made the animation
-   appear to jump half way through:
-
-     - Printing all 40 rows fills the display and then scrolls. Every row moves
-       up by one character cell at once, and a hypervisor repainting the text
-       buffer incrementally shows that as a frame or two of the screen caught
-       mid-move. It looks like the whole logo jerks sideways at exactly the
-       point the last visible row is reached -- which is over half way down a
-       40-row drawing, which is why it read as "shifts at the half".
-
-     - Printing 77 columns onto a terminal narrower than 77 wraps every art row
-       onto two, so the logo grows two rows at a time and tears. The gate only
-       requires 46 columns, so this was reachable.
-
-   So the art is clipped to the screen rather than allowed to overrun it, and
-   every row is placed at an absolute screen row with no newline after it. That
-   makes the console never scroll: on a tall terminal the whole shield appears,
-   and on a standard one the bottom is cut off and the logo grows steadily
-   downward without moving at all. */
-static void boot_sequence(void) {
-    if (!ui_fancy) { banner(); return; }
-
-    cursor_show(0);
-    clr();
-
-    int vis_rows = COPPER_SHIELD_ROWS;
-    int vis_cols = COPPER_SHIELD_WIDTH;
-    if (vis_cols > term_cols) vis_cols = term_cols;
-
-    /* Start row: centre it when it fits, otherwise show it from the top and
-       let the bottom be the part that gets cut. */
-    int start_row = 1;
-    if (vis_rows > term_rows) {
-        vis_rows = term_rows;
-    } else {
-        start_row = (term_rows - vis_rows) / 2 + 1;
-    }
-
-    int indent = (term_cols - vis_cols) / 2;
-    if (indent < 0) indent = 0;
-
-    /* Draw a row at a time. If somebody presses a key the pause stops, but the
-       remaining rows are still drawn -- instantly -- so that skipping produces
-       the finished shield rather than a half-drawn one. */
-    int skip = 0;
-    for (int i = 0; i < vis_rows; i++) {
-        at(start_row + i, indent + 1);
-        /* Clip to what the terminal actually has. The shield is 77 columns and
-           the console is 80, so this is a no-op there -- but on a narrower
-           terminal an unclipped fputs() runs past the right edge, the terminal
-           wraps it onto the next row, and every row below is drawn one line
-           too low. That is the same class of bug as the splash jumping, and
-           it was fixed once already. */
-        printf("%.*s", vis_cols, COPPER_SHIELD[i]);
-        fflush(stdout);
-        if (!skip) {
-            msleep(BOOT_LINE_DELAY_MS);
-            if (key_pending()) skip = 1;
-        }
-        /* Once skipping, keep flushing: a second keypress while the rest of
-           the art draws should not turn up as the first character of the first
-           answer either. */
-        if (skip) drain_keys();
-    }
-
-    msleep(350);
-    clr();
-
-    int wm_rows = COPPER_WORDMARK_ROWS;
-    int wm_cols = COPPER_WORDMARK_WIDTH;
-    if (wm_cols > term_cols) wm_cols = term_cols;
-
-    /* Clamp the rows to the terminal, and when it does not fit show it from
-       the top and let the bottom be cut. Identical to the shield's rule and
-       needed for the same reason: writing on or below the last row is what
-       makes a terminal scroll, which is the one thing this routine exists to
-       prevent.
-
-       The wordmark had no clamp at all. wm_top went negative and was then
-       forced to 1, so on a terminal shorter than 18 rows it addressed rows
-       below the bottom edge and scrolled the display. The 50x14 pty case hit
-       it and took the emulator down with an index error before it could check
-       anything else, which is why nothing caught it until now. */
-    int wm_top = 1;
-    if (wm_rows > term_rows) {
-        wm_rows = term_rows;
-    } else {
-        wm_top = (term_rows - wm_rows) / 2 + 1;
-    }
-    if (wm_top < 1) wm_top = 1;
-
-    int wm_left = (term_cols - wm_cols) / 2 + 1;
-    if (wm_left < 1) wm_left = 1;
-    for (int i = 0; i < wm_rows; i++) {
-        at(wm_top + i, wm_left);
-        printf("%.*s", wm_cols, COPPER_WORDMARK[i]);
-    }
-    fflush(stdout);
-    msleep(1400);
-
-    clr();
-
-    /* Discard every key pressed during the animation, unconditionally.
-
-       This does not depend on the skip detection having worked, which matters:
-       that detection is a select() for a waiting key, and there is at least
-       one tty -- a WSL2 pty, which is the only kind of terminal available on
-       the build host -- where select reports "nothing waiting" for a byte
-       that is demonstrably sitting in the line discipline's queue. On such a
-       tty the animation cannot be skipped, but without this line the key that
-       was pressed anyway survives into the form and silently eats the first
-       character of the first answer. A stray keystroke must never be able to
-       corrupt an answer, whether or not anything noticed it first. */
-    tcflush(STDIN_FILENO, TCIFLUSH);
-
-    cursor_show(1);
-}
-
 /* ------------------------------------------------------------------ */
 /*  the questions, as a table                                         */
+/* ------------------------------------------------------------------ */
 /* ------------------------------------------------------------------ */
 
 enum { F_NAME, F_USER, F_HOST, F_ROOTPW, F_USERPW, F_TZ, F_COUNT };
@@ -1050,7 +894,7 @@ int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
 
     ui_init();
-    boot_sequence();
+    banner();
 
     /* Every question up front, in the table. They used to be interleaved with
        the work -- your own password was asked after the account had already
