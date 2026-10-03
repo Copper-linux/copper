@@ -30,8 +30,10 @@ general daily use.
 |---|---|
 | `copper-sh` (shell) | Works. Arrow-key line editing, history, pipes, redirects. |
 | Networking | Works — wired only. DHCP on boot, `ping`/`nslookup`/`wget` present. |
-| `copper charge` / `copper rollback` | Ship in the ISO. Logic tested end to end off-ISO; not yet run on a booted system. |
-| First-boot wizard | Boots and asks its questions. Account creation fixed, but a full clean run is still unconfirmed. |
+| `copper charge` / `copper rollback` | Works. Every charge takes a restore point before it changes anything, so rollback has something to put back even when nothing needed patching. |
+| First-boot wizard | Boot animation, then a centred table of questions, then the account. Boots to a `you@copper` prompt. |
+| Shell starts in your home | Yes. Lands in `/home/<user>`, not `/`. |
+| Text editor | busybox `vi`. `nano` is not built — it needs ncurses. |
 | GUI | Not started — planned for later. |
 | Base system (kernel, musl, userland) | Building from source, CI green end to end. |
 | Bootable ISO | Builds successfully. Boots in a VM. |
@@ -91,6 +93,79 @@ once it's built out.
 
 ---
 
+## copper-firstboot
+
+What you see the first time the ISO boots:
+
+1. **The shield**, drawn a line at a time at about 100ms per line. Press any
+   key to skip to the end of it.
+2. **The wordmark**, `COPPER LINUX`, centred. Held for a moment.
+3. **A table of questions**, centred, with a live status line underneath.
+   Every question is asked up front, then the answers are applied.
+
+```
++----------------------------------------------------------------+
+|   Copper Linux  -  first boot setup                            |
++----------------------------------------------------------------+
+|   Your name           Zaphod                                    |
+|   Username            zaphod                                    |
+|   Hostname            attic-box                                 |
+|   Root password      ********                                   |
+|   Your password      ********                                   |
+|   Timezone            UTC                                       |
++----------------------------------------------------------------+
+|What should Copper call you?                                     |
++----------------------------------------------------------------+
+```
+
+Each row shows the answer once there is one, and a hint until then — the
+hint is a default you get by pressing Enter, not text you have to clear.
+Typing overwrites it. Arrow keys, Backspace and Ctrl-U all work; passwords
+are echoed as `*` and asked for twice.
+
+The table is only used when the terminal is big enough for it and is a real
+terminal at all: at least 46 columns by 14 rows, and both stdin and stdout
+have to be a tty. Otherwise it falls back to one plain question at a time,
+with no animation and no escape sequences. That is deliberate — the VGA
+console is 80x25 but a serial console is whatever someone chose, and
+clearing someone's scrollback to show them a progress animation is rude.
+
+Box drawing is `+`, `-` and `|` only. The VGA console font has no box-drawing
+characters or em dashes, so anything prettier arrives as a row of blanks.
+
+### The art
+
+The shield and the wordmark are generated, not hand-typed into the source:
+
+```sh
+python3 tools/gen-boot-art.py     # writes iso/firstboot/boot-art.h
+```
+
+That matters more than it sounds. A single dropped `@` in a block of ASCII is
+invisible in a diff and turns the logo into a smudge, so the art has one
+source and one command that regenerates it.
+
+The wordmark is a compact 7-row 5x7 block font rather than the tall
+display one. The display cut is 22 rows by 194 columns, which cannot fit an
+80-column console — it wraps into nonsense — so the block font is what
+actually renders on a VGA terminal.
+
+### Answers are validated
+
+Everything that ends up in a shell command is checked before it is used.
+The hostname and the timezone both go into `system()` calls:
+
+```sh
+echo <hostname> > /etc/hostname
+ln -sf /usr/share/zoneinfo/<timezone> /etc/localtime
+```
+
+so an unvalidated answer would be shell, not a hostname. Every field has a
+validator and a rejection message, and the same rules apply on both the
+table and the plain path.
+
+---
+
 ## copper-sh
 
 A small POSIX-style shell, written in C. Mostly builtins for now, so it can
@@ -134,14 +209,20 @@ ISO rebuild, no reinstall, and if a fix turns out to be wrong there is a way
 back.
 
 ```sh
-copper charge                  # apply every hotfix that applies
-copper charge --status         # (same thing — no real dry-run mode yet)
-copper rollback                # list available backups
-copper rollback <backup_name>  # put one back
+copper charge                  # take a restore point, then apply what applies
+copper charge --status         # say what would change, change nothing
+copper charge --backup         # take the restore point and stop
+copper charge --dump-entries   # print every entry the parser can see
+copper rollback                # list restore points and what is in them
+copper rollback --latest       # put the most recent restore point back
+copper rollback <snapshot>     # put a named one back
 ```
 
-Both need root. Backups land in `/var/backups/copper/`, and every action is
-appended to `/var/log/copper-charge.log`.
+Applying anything needs root. `--help` and `--dump-entries` deliberately do not:
+they change nothing, and they are the first thing to reach for when working out
+why a charge did nothing.
+
+Every action is appended to `/var/log/copper-charge.log`.
 
 ### Writing a hotfix
 
@@ -171,12 +252,29 @@ appended to `/var/log/copper-charge.log`.
 
 ### How it decides
 
-- `fail_code` present in the file → back it up, then replace it. Repeat until
-  the text is gone.
-- `fail_code` absent → skip with `already fixed?`. This is what makes
-  `copper charge` safe to run twice, or on a machine that already has the fix.
-- File missing → skip, do not create it. `copper charge` never writes a new
-  file; it only patches one that already exists.
+Every run, in this order:
+
+1. **Take a restore point.** Copy every file the database refers to that is
+   actually present on this system into a new snapshot directory, *before
+   anything is modified*. Whether or not anything then turns out to need
+   fixing.
+2. **For each entry**, look for `fail_code` as a literal string in the file.
+3. **Replace** every occurrence of it with `new_code`, and say so.
+
+| Situation | What happens |
+|---|---|
+| `fail_code` present | Backed up in step 1, then replaced |
+| `fail_code` absent | `skipping <id> - <file> does not need it (already fixed?)` |
+| File not installed | `skipping <id> - <file> is not on this system` |
+| Entry has no `fail_code` | Skipped, and the reason is said |
+
+Skips are reported out loud rather than passed over in silence. A hotfix
+pointing at a file this system does not have is the one case you cannot work
+out for yourself from the output, and it looks identical on screen to a hotfix
+that applied.
+
+That is what makes `copper charge` safe to run twice, or on a machine that
+already has the fix.
 
 There is no automatic failure detection. A human maintainer writes the entry,
 and `copper charge` applies the text edits. Anything subtler than a literal
@@ -200,16 +298,32 @@ at all. Delete that file to go back to always fetching.
 
 ### Rollback
 
-`copper charge` writes backups under `/var/backups/copper/`, naming each one
-after the file it came from with `/` turned into `_`:
+A snapshot is a directory under `/var/backups/copper/`, named for when it was
+taken, with a copy of each file and a `MANIFEST` naming what those copies came
+from:
 
 ```
-/etc/copper/demo.txt   →   etc_copper_demo.txt
+/var/backups/copper/2026-10-02_16-30-12/
+    MANIFEST              <- one absolute path per line
+    etc_copper_demo.txt
 ```
 
-`copper rollback` with no arguments lists them; give it one name to restore.
-The current file is saved as `<name>.pre-rollback` first, so a rollback can
-itself be undone.
+`copper rollback` with no arguments lists them and what is in each.
+`copper rollback --latest` restores the newest; `copper rollback <name>`
+restores a specific one. Restoring copies the current file aside into a
+`pre-rollback-*` directory first, so a rollback can itself be undone.
+
+**The snapshot is taken before anything is modified, not at the moment a fix
+lands.** This is the part that matters. The first version of this copied a file
+only when it patched it, which meant a machine where nothing needed patching
+ended up with no backups at all — so `copper rollback` had nothing to restore
+and could only say so, which is the exact question it exists to answer, asked
+too late. A snapshot taken up front exists even when the charge did nothing,
+because "put these files back the way they were at 16:30" is the thing you
+actually want after a bad charge.
+
+Snapshots are kept indefinitely. There is no pruning; on a live system the
+volume is a few files per charge.
 
 ### Notes and limits
 
@@ -219,8 +333,35 @@ itself be undone.
   `--no-check-certificate`. That is fine for fetching a JSON file from a
   known repo over a link you already trust; it is **not** fine for anything
   security-sensitive.
-- Both scripts are plain busybox `sh`. No python on the live system.
-- Only the first occurrence of `fail_code` is replaced per pass.
+- All three tools are plain busybox `sh`. No python on the live system. The
+  build checks that they parse as POSIX `sh` and not just as bash, since
+  busybox `ash` is what will run them.
+- The JSON parser is hand-written `awk`. It is checked at build time by
+  comparing the entries it produces against the entries the file declares —
+  see below.
+- `fail_code` must not contain `|`. It is used as the `sed` delimiter.
+
+### Two failure modes worth knowing about
+
+**The parser only reading the last entry.** The original JSON splitter
+buffered from the outermost `{`, which is the object *containing* `"hotfixes":
+[ ... ]`, so it concatenated the whole file into one line. Every field was
+then pulled out of that line with a greedy `sed`, which returns the **last**
+match — so every field came back as the last entry's value and every entry but
+the last was invisible, with no error and no change. The shipped database has
+exactly one entry, and one entry always works, so it survived. It is now split
+per object, keying off each object's own keys.
+
+`iso/assert-hotfix-db.sh` exists to stop that coming back. It runs the real
+parser and requires one output line per `fail_code` key in the file, no empty
+field, and no value containing a tab. It runs in CI.
+
+**An apostrophe inside a single-quoted `awk` program.** The parser is written
+as `awk '...'`, so an apostrophe in a comment inside that body closes the shell
+string early and the rest of the awk is handed to the shell to execute. It
+fails as `buf[depth]: not found`, which points at nothing useful. That is why
+the `awk` block in `copper-charge.sh` has a comment about it, and why the
+parse gate exists.
 
 ---
 
@@ -235,26 +376,43 @@ iso/build.sh          from-source distro build
 iso/copper.sh         installs as /usr/bin/copper
 iso/copper-charge.sh  installs as /usr/bin/copper-charge
 iso/copper-rollback.sh installs as /usr/bin/copper-rollback
+iso/assert-hotfix-db.sh  build gate: the database must survive the parser
 iso/live/init         live initramfs
 iso/boot/             GRUB config
 iso/src-init/         copper-init source
 iso/firstboot/        copper-firstboot source
+iso/firstboot/boot-art.h   generated shield + wordmark
+tools/gen-boot-art.py regenerates the art above
 iso/rootfs-overlay/   default /etc for the rootfs
-tests/smoke.sh        sanity checks
+tests/smoke.sh        copper-sh sanity checks
+tests/charge.sh       charge/rollback cycle, end to end, in a sandbox
 Makefile
 HANDOFF.md            current state, next-person notes
 PR.md                 PR notes/template
 ```
 
+### Tests
+
+```sh
+make -s && ./tests/smoke.sh     # the shell
+sudo ./tests/charge.sh          # the hotfix tools, end to end
+```
+
+`tests/charge.sh` runs the three real scripts against a sandbox in `/tmp`,
+pointed there by `COPPER_CONFIG`. It covers the whole cycle including the case
+that started the rewrite: a charge that applies nothing must still leave a
+rollback something to restore. Exits 77 without root.
+
 ---
 
 ## What's next
 
-- A confirmed clean first boot: wizard asks everything, creates the account,
-  drops to a `dragon@copper` prompt
-- `copper charge` run against a real booted system, not just off-ISO
+- Persistence — answers that survive a reboot rather than applying for the
+  live session only
+- `copper charge --update` to pull a newer hotfix database, and a hotfix
+  type that can create a file instead of editing an existing one
+- Skipping the boot animation from the kernel command line
 - WiFi, if we decide a VM-testable target is possible at all
-- `copper charge --status` as a real dry run
 - GUI — no timeline yet, comes after the base system is solid
 - `~/.copperrc` init file for the shell
 - Shell history persisted to disk

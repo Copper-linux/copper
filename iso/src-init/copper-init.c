@@ -1,6 +1,5 @@
 /*
  * copper-init — Copper Linux PID 1.
- * handcrafted by 12hrformat
  *
  * No systemd, no init scripts: this IS the init. It mounts the basics
  * (the initramfs already did most of it), applies the hostname, brings the
@@ -179,8 +178,8 @@ static void start_dhcp(const char *ifname) {
     if (pid != 0)
         return;
     /* udhcpc passes its own environment to the lease script and never sets
-       PATH itself, so the script needs one to find ip(8). */
-    setenv("PATH", "/sbin:/usr/sbin:/bin:/usr/bin", 1);
+       PATH itself, so the script needs one to find ip(8). It already inherits
+       the PATH set in main() before anything was forked. */
     snprintf(pidfile, sizeof pidfile, "/run/udhcpc.%s.pid", ifname);
     execl("/sbin/udhcpc", "udhcpc", "-i", ifname, "-b", "-p", pidfile,
           (char *)NULL);
@@ -241,6 +240,32 @@ static pid_t spawn_tty(int tty) {
 int main(void) {
     console_stdio();
 
+    /* PATH, set once, here, before anything is forked.
+
+       This was the cause of "ip: command not found" and "ifconfig: command
+       not found" on a booted system, and it is worth writing down properly
+       because the commands were never missing.
+
+       PID 1 starts with an environment the kernel builds, and it has no PATH
+       in it. When a program has no PATH, execvp() falls back to
+       confstr(_CS_PATH), which is the kernel's compiled-in default:
+
+           /bin:/usr/bin
+
+       Copper's networking applets are in sbin. So `ip`, `ifconfig`, `route`,
+       `arp` and everything else installed under /sbin and /usr/sbin were
+       unreachable by name, while `ping`, `grep`, `touch` and the rest worked
+       because they are in /bin and /usr/bin. The commands were present,
+       compiled in, and correctly linked the whole time -- the shell was
+       simply never told to look in sbin.
+
+       Setting it in start_dhcp() did not help, because that runs in a forked
+       child: the child got a PATH and the shell, which is what people
+       actually type at, did not. Anything that wants a PATH has to inherit
+       it from here. */
+    setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+           1);
+
     signal(SIGINT, SIG_IGN);
     signal(SIGTERM, SIG_IGN);
     signal(SIGHUP, SIG_IGN);
@@ -289,6 +314,45 @@ int main(void) {
         }
         int wst;
         waitpid(wiz, &wst, 0);
+    }
+
+    /* Land in the user's own home, not in /.
+
+       This has to happen after the wizard, not before: on a first boot the
+       done-marker does not exist yet, so reading it any earlier finds nothing.
+       /etc/copper-firstboot.done holds the username on its first line, written
+       by the wizard as it finishes.
+
+       Dropping someone at / is worth avoiding. That is uid 0 sitting next to
+       /boot, /etc and the block devices, with no login in front of it. This
+       does not make the system safe -- init goes straight to a root shell, and
+       pretending otherwise would be worse than saying so plainly -- but the
+       working directory should not be the root of the filesystem. */
+    {
+        char who[64] = "";
+        FILE *m = fopen("/etc/copper-firstboot.done", "r");
+        if (m) {
+            if (fgets(who, sizeof who, m)) {
+                char *nl = strchr(who, '\n');
+                if (nl) *nl = '\0';
+            }
+            fclose(m);
+        }
+        if (who[0]) {
+            char home[160];
+            snprintf(home, sizeof home, "/home/%s", who);
+            /* Only adopt it if it is a real, enterable directory: a stale
+               marker left by a half-finished wizard must not put us somewhere
+               that does not exist. */
+            if (access(home, X_OK) == 0 && chdir(home) == 0) {
+                setenv("HOME", home, 1);
+                setenv("USER", who, 1);
+                setenv("LOGNAME", who, 1);
+            } else {
+                printf("copper: no home directory at %s -- staying in /\n",
+                       home);
+            }
+        }
     }
 
     /* Exactly one shell at a time. Keep the pid so the reaper below can wait on
